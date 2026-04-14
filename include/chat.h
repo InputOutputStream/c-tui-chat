@@ -54,17 +54,12 @@ typedef struct CHAT {
 typedef struct CHAT_WINDOW_STRUCT {
     WINDOW *msg_win;
     WINDOW *input_win;
+    WINDOW *channel_win;
+    WINDOW *pv_chat_win;
     WINDOW *users_win;
     WINDOW *status_win;
     int rows, cols; // Sera defini en fonction du contexte
 } window_t;
-
-typedef enum {
-    MSG_WIN,
-    INPUT_WIN,
-    USER_WIN,
-    STATUS_WIN,
-} window_msg_t;
 
 // Client message types (sent to server)
 typedef enum {
@@ -99,7 +94,9 @@ typedef enum {
 extern client_t clients[MAX_CLIENT]; // Liste des clients en cours
 extern chat_t chats[MAX_CHATS]; // Liste des chats en cours
 extern int client_count; // Nombre de clients connectés
-extern pthread_mutex_t clients_mutex; 
+extern int chat_count;
 extern int server_running; 
+extern pthread_mutex_t chats_mutex;
+extern pthread_mutex_t clients_mutex; 
 
 #endif // !CHAT_H

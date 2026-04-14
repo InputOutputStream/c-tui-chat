@@ -14,9 +14,11 @@
 #include <client.h>
 
 // Global variables
+pthread_mutex_t chats_mutex = PTHREAD_MUTEX_INITIALIZER;
 static client_t local_clients_list[MAX_CLIENT];
 static int local_client_count = 0;
 static int client_running = 1;
+int chat_count = 0;
 
 char* extract_delimited_content(char *buffer, char start_char, char end_char, int *start_pos) {
     char *pos = strchr(buffer + *start_pos, start_char);
@@ -130,27 +132,27 @@ void *receive_messages(void *arg) {
 
         switch (msg_type) {
             case MSG_AUTH_ACK:
-                update_status(window, "✅ Authentification réussie");
+                update_status(window, ":) Authentification réussie");
                 break;
 
             case MSG_AUTH_FAIL:
-                update_status(window, "❌ Authentification échouée");
+                update_status(window, ":( Authentification échouée");
                 break;
 
             case MSG_BROADCAST: 
-                display_messages(window, sender, content);
+                display_messages(window, sender, content, window->msg_win);
                 break;
             
             case MSG_USER_JOIN: 
-                display_messages(window, "Système", content);
+                display_messages(window, "Système", content, window->status_win);
                 break;
             
             case MSG_USER_LEAVE:
-                display_messages(window, "Système", content);
+                display_messages(window, "Système", content, window->status_win);
                 break;
 
             case MSG_CHANNEL_CREATION: 
-                display_messages(window, "Système", content);
+                display_messages(window, "Système", content, window->status_win);
                 break;
             
             case MSG_MSG: {
@@ -159,7 +161,8 @@ void *receive_messages(void *arg) {
                 if (sender_content) {
                     char sender_name[64];
                     snprintf(sender_name, sizeof(sender_name), "User%s", sender_content);
-                    display_messages(window, sender_name, content + start_pos);
+                    
+                    display_messages(window, sender_name, content + start_pos, window->msg_win);
                     free(sender_content);
                 }
                 break;
@@ -178,11 +181,11 @@ void *receive_messages(void *arg) {
                 break;
             
             case MSG_SERVER_INFO: 
-                display_messages(window, "Serveur", content);
+                display_messages(window, "Serveur", content, window->msg_win);
                 break;
             
             default:
-                display_messages(window, "Inconnu", content);
+                display_messages(window, "Inconnu", content, window->msg_win);
                 break;
         }
         
@@ -360,4 +363,66 @@ int is_client_running() {
 
 void set_client_running(int running) {
     client_running = running;
+}
+
+
+
+// // Fonction pour envoyer un message (appelée depuis votre code serveur)
+// void send_message_to_chat(uint16_t sender_id, uint16_t receiver_id, const char *message, window_t *window) {
+//     int chat_id = find_or_create_chat(sender_id, receiver_id);
+//     if (chat_id == -1) return;
+    
+//     // Ajouter le message au chat
+//     add_message_to_chat(chat_id, sender_id, receiver_id, message);
+    
+//     // Rafraîchir l'affichage seulement si on est dans ce chat
+//     if (current_mode == 1 && current_chat_id == chat_id) {
+//         display_chat_messages(window, chat_id);
+//     }
+    
+//     // Sinon, le message est stocké et sera affiché quand l'utilisateur basculera vers ce chat
+// }
+
+
+// Fonction pour trouver ou créer un chat
+int find_or_create_chat(uint16_t user1_id, uint16_t user2_id) {
+    pthread_mutex_lock(&chats_mutex);
+    
+    // Chercher un chat existant entre ces deux utilisateurs
+    for (int i = 0; i < chat_count; i++) {
+        if (chats[i].participants_count == 2) {
+            // Vérifier si les deux participants correspondent
+            int found_user1 = 0, found_user2 = 0;
+            for (int j = 0; j < 2; j++) {
+                if (chats[i].participants[j]->client_id == user1_id) found_user1 = 1;
+                if (chats[i].participants[j]->client_id == user2_id) found_user2 = 1;
+            }
+            if (found_user1 && found_user2) {
+                pthread_mutex_unlock(&chats_mutex);
+                return i;
+            }
+        }
+    }
+    
+    // Créer un nouveau chat
+    if (chat_count < MAX_CHATS) {
+        chats[chat_count].chat_id = chat_count;
+        chats[chat_count].messages_count = 0;
+        chats[chat_count].participants_count = 0;
+        
+        // Ajouter les participants
+        for (int i = 0; i < client_count; i++) {
+            if (clients[i].client_id == user1_id || clients[i].client_id == user2_id) {
+                chats[chat_count].participants[chats[chat_count].participants_count] = &clients[i];
+                chats[chat_count].participants_count++;
+            }
+        }
+        
+        chat_count++;
+        pthread_mutex_unlock(&chats_mutex);
+        return chat_count - 1;
+    }
+    
+    pthread_mutex_unlock(&chats_mutex);
+    return -1;
 }

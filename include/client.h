@@ -71,9 +71,18 @@ void set_client_running(int running);
 
 // Interface functions (to be implemented in interface.c)
 window_t *init_interface();
+void refresh_interface(window_t *window);
 void cleanup_interface(window_t *window);
-void display_messages(window_t *window, const char *sender, const char *message);
+void display_chat_messages(window_t *window, int chat_id);
+void display_messages(window_t *window, const char *user_name, const char *messages, WINDOW *win_type);
 void update_status(window_t *window, const char *status);
-void update_client_list(window_t *window);
+// void update_client_list(window_t *window);
+void switch_to_private_chat(window_t *window, const char *chat_name);
+void switch_to_channel(window_t *window, const char *channel_name); 
+void switch_to_general_messages(window_t *window);
+WINDOW* get_active_window(window_t *window, int mode); 
+void display_general_messages(window_t *window);
+void add_message_to_chat(int chat_id, uint16_t sender_id, uint16_t receiver_id, const char *message);
+int find_or_create_chat(uint16_t user1_id, uint16_t user2_id);
 
 #endif // !CLIENT_H

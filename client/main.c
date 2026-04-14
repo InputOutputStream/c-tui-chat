@@ -73,7 +73,7 @@ int main() {
         return EXIT_FAILURE;
     }
     
-    update_status(app->window, "✅ Connecté au serveur - Tapez vos messages");
+    update_status(app->window, ":) Connecté au serveur - Tapez vos messages");
     
     // Prepare arguments for receive thread
     args_t thread_args = {
@@ -105,6 +105,9 @@ int main() {
         "/chat - Mode chat général",
         "/leave_channel - Quitter le canal actuel",
         "/create_channel <name> - Créer un nouveau canal"
+        /**
+         * On veut une autre option pour directement commencer une discussion avec un utilisateur
+         * */
     };
     const int commandes_number = sizeof(commands) / sizeof(commands[0]);
 
@@ -120,9 +123,11 @@ int main() {
                     
                     // Commandes
                     if (strcmp(input_buffer, "/help") == 0) {
-                        display_messages(app->window, "Aide", "Commandes disponibles:");
+                        // display_messages(window, sender, content, window->msg_win);
+
+                        display_messages(app->window, "System", "Commandes disponibles:", app->window->msg_win);
                         for (int i = 0; i < commandes_number; i++) {
-                            display_messages(app->window, "Commandes", commands[i]);
+                            display_messages(app->window, "System", commands[i], app->window->msg_win);
                         }
                     }
                     else if (strcmp(input_buffer, "/quit") == 0) {
@@ -136,39 +141,47 @@ int main() {
                             int len = snprintf(formatted_msg, sizeof(formatted_msg), "[%s]", channel_id);
                             
                             if (len < MAX_MESSAGE_LENGHT && send_formatted_message(MSG_JOIN_CHANNEL, formatted_msg, app->client) == 0) {
-                                display_messages(app->window, "Système", "Demande de connexion au canal envoyée");
+                                display_messages(app->window, "Systeme", "Demande de connexion au canal envoyée", app->window->status_win);
                             } else {
                                 update_status(app->window, "❌ Erreur lors de la connexion au canal");
                             }
                         } else {
-                            display_messages(app->window, "Erreur", "Usage: /join <channel_id>");
+                            display_messages(app->window, "System", "Usage: /join <channel_id>", app->window->status_win);
                         }
                     }
                     else if (strncmp(input_buffer, "/create_channel ", 16) == 0) {
                         char* channel_name = get_command_arg(input_buffer);
                         if (channel_name) {
                             if (send_formatted_message(MSG_CREATE_CHANNEL, channel_name, app->client) == 0) {
-                                display_messages(app->window, "Système", "Demande de création de canal envoyée");
+                                display_messages(app->window, "Système", "Demande de création de canal envoyée", app->window->status_win);
                             } else {
                                 update_status(app->window, "❌ Erreur lors de la création du canal");
                             }
                         } else {
-                            display_messages(app->window, "Erreur", "Usage: /create_channel <nom_du_canal>");
+                            display_messages(app->window, "System", "Usage: /create_channel <nom_du_canal>", app->window->status_win);
                         }
                     }
                     else if (strcmp(input_buffer, "/leave_channel") == 0) {
                         if (send_formatted_message(MSG_LEAVE_CHANNEL, "", app->client) == 0) {
-                            display_messages(app->window, "Système", "Demande de sortie du canal envoyée");
+                            display_messages(app->window, "Système", "Demande de sortie du canal envoyée", app->window->status_win);
+
                         } else {
                             update_status(app->window, "❌ Erreur lors de la sortie du canal");
                         }
                     }
                     else if (strcmp(input_buffer, "/chat") == 0) {
-                        display_messages(app->window, "Info", "Vous êtes en mode chat général");
+                        display_messages(app->window, "System", "Vous êtes en mode chat général", app->window->status_win);
+                    }
+                    else if (strncmp(input_buffer, "/User", 4) == 0) {
+                        werase(app->window->msg_win);
+                        display_messages(app->window, "System", ": ", app->window->msg_win);
+
+                        // Implementation de la logique de coversation
+
                     }
                     else {
                         // Message normal
-                        display_messages(app->window, "Vous", input_buffer);
+                        display_messages(app->window, "Vous", input_buffer, app->window->msg_win);
                         
                         if (send_formatted_message(MSG_BROADCAST_CLIENTS, input_buffer, app->client) < 0) {
                             update_status(app->window, "❌ Erreur envoi message");
@@ -207,7 +220,7 @@ int main() {
         static time_t last_update = 0;
         time_t now = time(NULL);
         if (now - last_update > 1) {
-            update_client_list(app->window);
+            update_client_list_from_server(app->window, input_buffer);
             last_update = now;
         }
     }

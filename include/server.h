@@ -44,7 +44,7 @@ char *list_users();
 void signal_handler(int sig);
 
 // Interface functions (if UI exists)
-extern void display_messages(window_t *window, const char *user_name, const char *messages);
+extern void send_display_signal(window_t *window, const char *user_name, const char *messages);
 extern void update_client_list(window_t *window);
 extern void update_status(window_t *window, const char *status);
 extern void cleanup_interface(window_t *window);
