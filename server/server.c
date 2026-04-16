@@ -10,52 +10,78 @@
 #include <unistd.h>
 #include <errno.h>
 
-#include <chat.h>
-#include <server.h>
+#include "chat.h"
+#include "server.h"
 
+// External globals from main.c
+extern client_t clients[MAX_CLIENT];
+extern chat_t chats[MAX_CHATS];
+extern int client_count;
+extern pthread_mutex_t clients_mutex;
+extern pthread_mutex_t chats_mutex;
+extern int server_running;
 
-int start_message_server()
-{
-    //Création du socket
+// Static counter for unique client IDs
+static int next_client_id = 0;
+static pthread_mutex_t id_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+int start_message_server() {
+    // Create socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
-        perror("socketcreation failed");
+        perror("Socket creation failed");
         return -1;
     }
 
-    // Réutilisation de l'adresse, de la machine pour l'interface 1 je supose
+    // Set socket options for address reuse
     int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    // Préparation de la structure sockaddr_in pour le serveur
-    struct sockaddr_in server_addr = {0};    
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(DEFAULT_PORT);  // Convertit en big-endian
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-
-    // Bind
-    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(struct sockaddr_in)) < 0) 
-    {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-
-   
-    if (listen(server_fd, MAX_CLIENT) < 0) {
-        perror("listen failed");
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("Setsockopt failed");
         close(server_fd);
         return -1;
     }
 
-    fprintf(stdout, "server address = %s\n", inet_ntoa(server_addr.sin_addr));
+    // Configure server address
+    struct sockaddr_in server_addr = {0};    
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(DEFAULT_PORT);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
 
-    //C'est Ici que tout commence, logique du server de chat
+    // Bind socket
+    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Bind failed");
+        close(server_fd);
+        return -1;
+    }
+
+    // Listen for connections
+    if (listen(server_fd, MAX_CLIENT) < 0) {
+        perror("Listen failed");
+        close(server_fd);
+        return -1;
+    }
+
+    fprintf(stdout, "Server address = %s:%d\n", 
+            inet_ntoa(server_addr.sin_addr), DEFAULT_PORT);
+
+    // Create accept thread
     pthread_t accept_thread;
-    int *server_fd_ptr = calloc(1, sizeof(int));
+    int *server_fd_ptr = malloc(sizeof(int));
+    if (!server_fd_ptr) {
+        perror("Memory allocation failed");
+        close(server_fd);
+        return -1;
+    }
     *server_fd_ptr = server_fd;
 
-    pthread_create(&accept_thread, NULL, accept_connections, server_fd_ptr);
-    pthread_detach(accept_thread); // terminate automatically on close
+    if (pthread_create(&accept_thread, NULL, accept_connections, server_fd_ptr) != 0) {
+        perror("Failed to create accept thread");
+        free(server_fd_ptr);
+        close(server_fd);
+        return -1;
+    }
+    
+    pthread_detach(accept_thread);
     return 0;
 }
 
@@ -63,34 +89,85 @@ void *accept_connections(void *arg) {
     int server_fd = *((int*)arg);
     free(arg);
 
-    while(server_running)
-    {
+    while(server_running) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
-        if (client_fd < 0) continue; // on n'a pas reussi a le connecter bah on passe
-        fprintf(stdout, "New client Accepted: addr = %s \n", inet_ntoa(client_addr.sin_addr));
+        
+        if (client_fd < 0) {
+            if (server_running) {
+                perror("Accept failed");
+            }
+            continue;
+        }
+
+        fprintf(stdout, "New client accepted: addr = %s\n", 
+                inet_ntoa(client_addr.sin_addr));
 
         pthread_mutex_lock(&clients_mutex);
-        if(client_count < MAX_CLIENT)
-        {
-            client_t *client = &clients[client_count];
+        
+        if(client_count < MAX_CLIENT) {
+            // Find first available slot
+            int slot = -1;
+            for (int i = 0; i < MAX_CLIENT; i++) {
+                if (!clients[i].active) {
+                    slot = i;
+                    break;
+                }
+            }
+            
+            if (slot == -1) {
+                fprintf(stdout, "No available slots\n");
+                close(client_fd);
+                pthread_mutex_unlock(&clients_mutex);
+                continue;
+            }
+            
+            client_t *client = &clients[slot];
+            memset(client, 0, sizeof(client_t));
+            
+            // Get unique client ID
+            pthread_mutex_lock(&id_mutex);
+            client->client_id = next_client_id++;
+            pthread_mutex_unlock(&id_mutex);
+            
             client->client_fd = client_fd;
             client->client_addr = client_addr;
-            client->client_id = client_count;
             client->client_addr_len = addr_len;
             client->msg_count = 0;
             client->active = 1;
             client->connect_time = time(NULL);
             client->last_activity = client->connect_time;
-            snprintf(client->client_name, sizeof(client->client_name), "User%d", client_count);
+            snprintf(client->client_name, sizeof(client->client_name), 
+                    "User%d", client->client_id);
             
-            pthread_create(&client->thread, NULL, handle_client, client);
+            // Send welcome message with client details
+            char welcome_msg[256];
+            snprintf(welcome_msg, sizeof(welcome_msg), "ID:%d NAME:%s", 
+                    client->client_id, client->client_name);
+             
+            if(send(client->client_fd, welcome_msg, strlen(welcome_msg), 0) < 0) {
+                fprintf(stdout, "Failed to send welcome message\n");
+                close(client_fd);
+                client->active = 0;
+                pthread_mutex_unlock(&clients_mutex);
+                continue;
+            }
+
+            // Create client handler thread
+            if (pthread_create(&client->thread, NULL, handle_client, client) != 0) {
+                fprintf(stdout, "Failed to create client thread\n");
+                close(client_fd);
+                client->active = 0;
+                pthread_mutex_unlock(&clients_mutex);
+                continue;
+            }
+            
             client_count++;
-        }
-        else {
-            fprintf(stdout, "Connection Rejected: %s  \n", inet_ntoa(client_addr.sin_addr));
-            close(client_fd); // Reject connection
+        } else {
+            fprintf(stdout, "Connection rejected: %s (server full)\n", 
+                    inet_ntoa(client_addr.sin_addr));
+            close(client_fd);
         }
 
         pthread_mutex_unlock(&clients_mutex);
@@ -99,57 +176,157 @@ void *accept_connections(void *arg) {
     close(server_fd);
     return NULL;
 }
- 
 
-message_t init_message(client_t client, char *buffer)
-{
-    message_t new = {0};
-    strcpy(new.payload, buffer);
-    new.length = strlen(buffer);
-    new.sender_user_id = client.client_id;
-    new.receiver_user_id = -1;
-    new.timestamp = time(NULL);
-    
-    return new;
-}
+void *handle_client(void *arg) {
+    client_t *client = (client_t *)arg;
+    char buffer[MAX_MESSAGE_LENGHT];
 
+    // Start timeout handler
+    pthread_t timeout_thread;
+    if (pthread_create(&timeout_thread, NULL, handle_client_timeout, client) == 0) {
+        pthread_detach(timeout_thread);
+    }
 
-void clean_up_clients(pthread_t accept_thread)
-{
-    // Cleanup
-    pthread_cancel(accept_thread);
-    // Close remaining client connections
-    for(int i = 0; i < client_count; i++) {
-        if(clients[i].active) {
-            close(clients[i].client_fd);
+    while(server_running && client->active) {
+        ssize_t bytes = recv(client->client_fd, buffer, sizeof(buffer)-1, 0);
+
+        if(bytes <= 0) {
+            if (bytes == 0) {
+                fprintf(stdout, "Client %d disconnected normally\n", client->client_id);
+            } else {
+                fprintf(stdout, "Client %d connection error\n", client->client_id);
+            }
+            break;
+        }
+
+        buffer[bytes] = '\0';
+        client->last_activity = time(NULL);
+
+        // Parse message type
+        client_message_type_t msg_type = init_type_message(buffer);
+        
+        switch(msg_type) {
+            case MSG_AUTH_REQ:
+                // TODO: Implement authentication
+                break;
+                
+            case MSG_BROADCAST_CLIENTS:
+                broadcast_message(client, buffer);
+                break;
+                
+            case MSG_DISCONNECT:
+                fprintf(stdout, "Client %d requested disconnect\n", client->client_id);
+                remove_client(client);
+                goto cleanup;
+                
+            case MSG_SEND: {
+                int rec_id = get_rec_id(buffer);
+                if(rec_id < 0) {
+                    char error_msg[] = "Invalid receiver ID";
+                    send(client->client_fd, error_msg, strlen(error_msg), 0);
+                    break;
+                }
+                
+                client_t *receiver = find_client_by_id(rec_id);
+                if(receiver == NULL || !receiver->active) {
+                    char error_msg[] = "User not found or offline";
+                    send(client->client_fd, error_msg, strlen(error_msg), 0);
+                    break;
+                }
+
+                message_t message = init_message(*client, buffer);
+                message.receiver_user_id = rec_id;
+                
+                if (safe_send(receiver->client_fd, (char*)&message, sizeof(message)) < 0) {
+                    char error_msg[] = "Failed to deliver message";
+                    send(client->client_fd, error_msg, strlen(error_msg), 0);
+                }
+                break;
+            }
+
+            case MSG_CHANNEL: {
+                int id_number = 0;
+                int *ids = get_chat_clients_ids(buffer, &id_number);
+                if(ids != NULL) {
+                    send_to_chat(client, ids, id_number, buffer);
+                    free(ids);
+                } else {
+                    char error_msg[] = "Invalid channel members";
+                    send(client->client_fd, error_msg, strlen(error_msg), 0);
+                }
+                break;
+            }
+                
+            case MSG_LEAVE_CHANNEL: {
+                int chat_id = get_chat_id(buffer);
+                if(chat_id >= 0) {
+                    leave_chat(client, chat_id);
+                } else {
+                    char error_msg[] = "Invalid chat ID";
+                    send(client->client_fd, error_msg, strlen(error_msg), 0);
+                }
+                break;
+            }
+            
+            case MSG_LIST_USERS: {
+                char *user_list = list_users();
+                if (user_list) {
+                    send(client->client_fd, user_list, strlen(user_list), 0);
+                    free(user_list);
+                } else {
+                    char error_msg[] = "Failed to get user list";
+                    send(client->client_fd, error_msg, strlen(error_msg), 0);
+                }
+                break;
+            }
+            
+            case MSG_HEARTBEAT:
+                // Heartbeat already updates last_activity above
+                break;
+                
+            case MSG_CREATE_CHANNEL:
+                // TODO: Implement channel creation
+                break;
+                
+            case MSG_JOIN_CHANNEL:
+                // TODO: Implement channel joining
+                break;
+                
+            default:
+                fprintf(stderr, "Unknown message type: %d\n", msg_type);
+                break;
         }
     }
 
-    return;
+cleanup:
+    fprintf(stdout, "Client %d handler exiting\n", client->client_id);
+    client->active = 0;
+    close(client->client_fd);
+    remove_client(client);
+    return NULL;
 }
 
+// Message parsing functions
 char* extract_delimited_content(char *buffer, char start_char, char end_char, int *start_pos) {
+    if (!buffer || !start_pos) return NULL;
+    
     char *pos = strchr(buffer + *start_pos, start_char);
-    if (!pos) {
-        return NULL;
-    }
+    if (!pos) return NULL;
     
     int start_idx = pos - buffer + 1;
     char *end_pos = strchr(pos + 1, end_char);
-    if (!end_pos) {
-        return NULL;
-    }
+    if (!end_pos) return NULL;
     
     int len = end_pos - pos - 1;
-    if (len <= 0) {
-        return NULL;
-    }
+    if (len <= 0) return NULL;
     
     char *result = malloc(len + 1);
+    if (!result) return NULL;
+    
     strncpy(result, buffer + start_idx, len);
     result[len] = '\0';
     
-    *start_pos = end_pos - buffer + 1; // Update position for next search
+    *start_pos = end_pos - buffer + 1;
     return result;
 }
 
@@ -157,10 +334,7 @@ int get_chat_id(char *buffer) {
     int start_pos = 0;
     char *content = extract_delimited_content(buffer, '[', ']', &start_pos);
     
-    if (!content) {
-        fprintf(stderr, "Missing chat id from message\n");
-        return -1;
-    }
+    if (!content) return -1;
     
     int result = atoi(content);
     free(content);
@@ -171,10 +345,7 @@ int get_rec_id(char *buffer) {
     int start_pos = 0;
     char *content = extract_delimited_content(buffer, '%', '%', &start_pos);
     
-    if (!content) {
-        fprintf(stderr, "Missing receiver id from message\n");
-        return -1;
-    }
+    if (!content) return -1;
     
     int result = atoi(content);
     free(content);
@@ -182,11 +353,12 @@ int get_rec_id(char *buffer) {
 }
 
 int *get_chat_clients_ids(char *buffer, int *id_numbers) {
+    if (!id_numbers) return NULL;
+    
     int start_pos = 0;
     char *content = extract_delimited_content(buffer, '{', '}', &start_pos);
     
     if (!content) {
-        fprintf(stderr, "Missing receiver id from message\n");
         *id_numbers = 0;
         return NULL;
     }
@@ -198,8 +370,13 @@ int *get_chat_clients_ids(char *buffer, int *id_numbers) {
     }
     
     int *result = malloc(count * sizeof(int));
-    int index = 0;
+    if (!result) {
+        free(content);
+        *id_numbers = 0;
+        return NULL;
+    }
     
+    int index = 0;
     char *token = strtok(content, ",");
     while (token && index < count) {
         result[index++] = atoi(token);
@@ -211,160 +388,121 @@ int *get_chat_clients_ids(char *buffer, int *id_numbers) {
     return result;
 }
 
-client_message_type_t init_type_message(char *msg_types_buffer)
-{
+client_message_type_t init_type_message(char *msg_types_buffer) {
+    if (!msg_types_buffer) return 0;
+    
     int start_pos = 0;
     char *content = extract_delimited_content(msg_types_buffer, '#', '#', &start_pos);
     
-    if (!content) {
-        fprintf(stderr, "Missing message type from message\n");
-        client_message_type_t new = {0};
-        return new;
-    }
+    if (!content) return 0;
 
     int result = atoi(content);
     free(content);
     return result;
 }
 
+message_t init_message(client_t client, char *buffer) {
+    message_t new = {0};
+    
+    if (buffer) {
+        strncpy(new.payload, buffer, sizeof(new.payload) - 1);
+        new.payload[sizeof(new.payload) - 1] = '\0';
+        new.length = strlen(new.payload);
+    }
+    
+    new.sender_user_id = client.client_id;
+    new.receiver_user_id = -1;
+    new.timestamp = time(NULL);
+    
+    return new;
+}
 
-void *handle_client(void *arg)
-{
-    client_t *client =  (client_t *)arg;
-    char buffer[MAX_MESSAGE_LENGHT];
-    char msg_type_buffer[16];   
-
-    // Separate thread to handle each client operation
-    while(server_running && client->active)
-    {
-        size_t bytes = recv(client->client_fd, buffer, sizeof(buffer)-1, 0);
-
-        if(bytes <= 0) {
-            fprintf(stdout, "Connection closed with client: id = %d, name = %s \n", client->client_id, client->client_name);
-            break; // Connection closed or error
-        }
-
-        if(bytes > 0) {
-            buffer[bytes] = '\0';
-        }
-        client->last_activity = time(NULL);
-
-        
-        int rec_id = -1;
-        int chat_id = -1;
-        int *ids  = {0};
-        int id_number = 0;
-
-        client_message_type_t new = init_type_message(buffer);
-
-        switch(new){
-            case MSG_AUTH_REQ:
-                // Will be implemented later
-                break;
-            case MSG_BROADCAST_CLIENTS:
-                broadcast_message(client, buffer);
-                break;
-            case MSG_DISCONNECT:
-                remove_client(client);
-                break;
-            case MSG_SEND: 
-                // Send a message to a connected comm client
-                rec_id = get_rec_id(buffer);
-                if(rec_id < 0) break;
-                client_t *receiver = find_client_by_id(rec_id);
-                if(receiver == NULL || !receiver->active) {
-                        char error_msg[] = "User not found";
-                        send(client->client_fd, error_msg, strlen(error_msg), 0);
-                        break;
-                }
-
-                message_t message = init_message(*client, buffer);
-                message.receiver_user_id = rec_id;
-                send(receiver->client_fd, (void *)&message, sizeof(message), 0);
-                break;
-
-            case MSG_CHANNEL: 
-                ids = get_chat_clients_ids(buffer, &id_number);
-                if(ids != NULL) {
-                    send_to_chat(client, ids, id_number, buffer);
-                    free(ids);
-                }
-                break;
-                
-            case MSG_LEAVE_CHANNEL: 
-                chat_id = get_chat_id(buffer);
-                if(chat_id < 0)
-                {
-                    break;
-                }
-                leave_chat(client, chat_id);
-                break;
-            case MSG_LIST_USERS: 
-                list_users();
-                break;
-            case MSG_HEARTBEAT: 
-                break;       
-            case MSG_CREATE_CHANNEL:
-                break;
-            case MSG_JOIN_CHANNEL:
-                break;
-        }
-
-        if(ids != NULL) {
-            free(ids);
-            ids = NULL;
+// Client management functions
+client_t* find_client_by_id(int client_id) {
+    pthread_mutex_lock(&clients_mutex);
+    for(int i = 0; i < MAX_CLIENT; i++) {
+        if(clients[i].active && clients[i].client_id == client_id) {
+            pthread_mutex_unlock(&clients_mutex);
+            return &clients[i];
         }
     }
-
-    client->active = 0;
-    close(client->client_fd);
-    remove_client(client);
+    pthread_mutex_unlock(&clients_mutex);
     return NULL;
 }
 
-void send_to_chat(client_t *sender, int *chat_clients_ids, int id_number, char *message)
-{
+void _mark_as_inactive(int i) {
+    if (i >= 0 && i < MAX_CLIENT) {
+        clients[i].active = 0;
+        if (clients[i].client_fd > 0) {
+            close(clients[i].client_fd);
+            clients[i].client_fd = -1;
+        }
+    }
+}
+
+void mark_as_inactive(client_t *client) {
+    if (!client) return;
+    
     pthread_mutex_lock(&clients_mutex);
-    for(int j = 0; j < id_number; j++) {
-        int client_id = chat_clients_ids[j];
-        if(client_id >= 0 && client_id < client_count && 
-           clients[client_id].active && 
-           clients[client_id].client_fd != sender->client_fd) {
-            send(clients[client_id].client_fd, message, strlen(message), 0);
-            clients[client_id].msg_count++;
+    for(int i = 0; i < MAX_CLIENT; i++) {
+        if(&clients[i] == client) {
+            _mark_as_inactive(i);
+            break;
         }
     }
     pthread_mutex_unlock(&clients_mutex);
 }
 
+void remove_client(client_t *client) {
+    if (!client) return;
+    
+    mark_as_inactive(client);
+    
+    // Update client count
+    pthread_mutex_lock(&clients_mutex);
+    int active_count = 0;
+    for(int i = 0; i < MAX_CLIENT; i++) {
+        if(clients[i].active) active_count++;
+    }
+    client_count = active_count;
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+// Communication functions
 int safe_send(int sockfd, const char *message, size_t len) {
+    if (sockfd < 0 || !message || len == 0) return -1;
+    
     size_t total_sent = 0;
     while (total_sent < len) {
         ssize_t sent = send(sockfd, message + total_sent, len - total_sent, MSG_NOSIGNAL);
         if (sent < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Socket buffer full, could use select/poll here
+                usleep(1000); // Brief delay before retry
                 continue;
             }
-            return -1; // Error
+            return -1;
         }
         total_sent += sent;
     }
-    return 0; // Success
+    return 0;
 }
 
 void broadcast_message(client_t *sender, const char *message) {
+    if (!sender || !message) return;
+    
     pthread_mutex_lock(&clients_mutex);
     
     size_t msg_len = strlen(message);
     
-    for (int i = 0; i < client_count; i++) {
+    for (int i = 0; i < MAX_CLIENT; i++) {
         if (clients[i].active && clients[i].client_fd != sender->client_fd) {
-            fprintf(stdout, "send to %s: %s\n", clients[i].client_name, message);
+            fprintf(stdout, "Broadcasting to %s: %s\n", 
+                    clients[i].client_name, message);
             
             if (safe_send(clients[i].client_fd, message, msg_len) < 0) {
-                perror("Send broadcast failed");
-                // _mark_as_incative(i);
+                fprintf(stderr, "Failed to send broadcast to client %d\n", 
+                        clients[i].client_id);
+                _mark_as_inactive(i);
             } else {
                 clients[i].msg_count++;
             }
@@ -374,116 +512,73 @@ void broadcast_message(client_t *sender, const char *message) {
     pthread_mutex_unlock(&clients_mutex);
 }
 
-void _mark_as_incative(int i)
-{
- // Mark client as inactive on send failure
-    clients[i].active = 0;
-    close(clients[i].client_fd);
-}
-
-void mark_as_inactive(client_t *client) {
+void send_to_chat(client_t *sender, int *chat_clients_ids, int id_number, char *message) {
+    if (!sender || !chat_clients_ids || !message || id_number <= 0) return;
+    
     pthread_mutex_lock(&clients_mutex);
-    for(int i = 0; i < client_count; i++) {
-        if(&clients[i] == client) {
-            // Mark as inactive instead of shifting
-            _mark_as_incative(i);
-            break;
-        }
-    }
-    pthread_mutex_unlock(&clients_mutex);
-}
-
-void remove_client(client_t *client) {
-    mark_as_inactive(client);
-}
-
-
-int leave_chat(client_t *client, size_t chat_id)
-{
-    /***
-     * Will implement but lets first finish with the one on one communication
-     */
-    return 0;
-}
-
-char *list_users()
-{
-    /***
-     * Will implement but lets first finish with the one on one communication
-     */
-    return 0;
-}
-
-void compact_clients() {
-    pthread_mutex_lock(&clients_mutex);
-    int write_pos = 0;
-    for(int read_pos = 0; read_pos < client_count; read_pos++) {
-        if(clients[read_pos].active) {
-            if(write_pos != read_pos) {
-                clients[write_pos] = clients[read_pos];
+    
+    for(int j = 0; j < id_number; j++) {
+        client_t *target = find_client_by_id(chat_clients_ids[j]);
+        if (target && target->active && target->client_fd != sender->client_fd) {
+            if (safe_send(target->client_fd, message, strlen(message)) == 0) {
+                target->msg_count++;
+            } else {
+                fprintf(stderr, "Failed to send to client %d\n", target->client_id);
             }
-            write_pos++;
         }
     }
-    client_count = write_pos;
+    
     pthread_mutex_unlock(&clients_mutex);
 }
 
-client_t* find_client_by_id(int client_id) {
-    for(int i = 0; i < client_count; i++) {
-        if(clients[i].active && clients[i].client_id == client_id) {
-            return &clients[i];
-        }
-    }
-    return NULL;
+int send_signal(int rec_fd, client_message_type_t msg) {
+    if (rec_fd < 0) return -1;
+    
+    char signal_buffer[32];
+    snprintf(signal_buffer, sizeof(signal_buffer), "#%d#", msg);
+    
+    return safe_send(rec_fd, signal_buffer, strlen(signal_buffer));
 }
 
+// Timeout and validation functions
 void *handle_client_timeout(void *arg) {
-    client_t *client = (client_t*)arg;    
-    while (client->active) {
+    client_t *client = (client_t*)arg;
+    
+    while (client->active && server_running) {
         if (time(NULL) - client->last_activity > TIMEOUT) {
-            // Client trop lent, déconnexion
+            fprintf(stdout, "Client %d timed out\n", client->client_id);
             disconnect_slow_client(client);
             break;
         }
-        sleep(60);
+        sleep(60); // Check every minute
     }
+    
     return NULL;
 }
 
-int disconnect_slow_client(client_t *client)
-{   
-    printf("Disconnecting.......\n");
-    if(send_signal(client->client_fd, MSG_DISCONNECT) == -1)
-    {
-        fprintf(stderr, "Could Not Disconect %s\n", client->client_name);
-        return -1;
+int disconnect_slow_client(client_t *client) {
+    if (!client) return -1;
+    
+    printf("Disconnecting slow client %d...\n", client->client_id);
+    
+    if(send_signal(client->client_fd, MSG_DISCONNECT) == -1) {
+        fprintf(stderr, "Could not send disconnect signal to %s\n", 
+                client->client_name);
     }
 
     mark_as_inactive(client);
     return 0;
 }
 
-int send_signal(int rec_fd, client_message_type_t msg)
-{
-    char signal_buffer[16];
-    snprintf(signal_buffer, sizeof(signal_buffer), "#%d#", msg);
-    
-    if(send(rec_fd, signal_buffer, strlen(signal_buffer), 0) < 0) {
-        perror("Failed to send signal");
-        return -1;
-    }
-    return 0;
-}
-
-// Validation côté serveur
 int validate_client_message(client_t *client, message_t *msg) {
-    // Anti-spam
+    if (!client || !msg) return -1;
+    
+    // Anti-spam check
     if (client->msg_count > MAX_MESSAGES_PER_MINUTE) {
         return -1;
     }
     
-    // Validation contenu
+    // Content validation
     if (msg->length > MAX_MESSAGE_LENGHT) {
         return -1;
     }
@@ -491,16 +586,78 @@ int validate_client_message(client_t *client, message_t *msg) {
     return 0;
 }
 
-
-void free_chats(chat_t *chat)
-{
-    free(chat);
+// Utility functions
+void compact_clients() {
+    pthread_mutex_lock(&clients_mutex);
+    
+    // No actual compaction needed since we use fixed array with active flag
+    // Just update client_count
+    int active_count = 0;
+    for(int i = 0; i < MAX_CLIENT; i++) {
+        if(clients[i].active) active_count++;
+    }
+    client_count = active_count;
+    
+    pthread_mutex_unlock(&clients_mutex);
 }
 
-void signal_handler(int sig) {
+void clean_up_clients(pthread_t accept_thread) {
+    // Signal all clients to disconnect
+    pthread_mutex_lock(&clients_mutex);
+    for(int i = 0; i < MAX_CLIENT; i++) {
+        if(clients[i].active) {
+            close(clients[i].client_fd);
+            clients[i].active = 0;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+    
+    // Cancel accept thread
+    pthread_cancel(accept_thread);
+}
 
-    switch (sig)
-    {
+// Chat management (stub implementations)
+int leave_chat(client_t *client, size_t chat_id) {
+    // TODO: Implement chat leaving logic
+    fprintf(stdout, "Client %d left chat %zu\n", client->client_id, chat_id);
+    return 0;
+}
+
+char *list_users() {
+    pthread_mutex_lock(&clients_mutex);
+
+    // Calculate needed buffer size
+    size_t buffer_size = 1024;
+    char *user_list = malloc(buffer_size);
+    if (!user_list) {
+        pthread_mutex_unlock(&clients_mutex);
+        return NULL;
+    }
+    
+    strcpy(user_list, "Active users:\n");
+    
+    for(int i = 0; i < MAX_CLIENT; i++) {
+        if(clients[i].active) {
+            char user_info[256];
+            snprintf(user_info, sizeof(user_info), "ID:%d NAME:%s\n", 
+                    clients[i].client_id, clients[i].client_name);
+            strcat(user_list, user_info);
+        }
+    }
+    
+    pthread_mutex_unlock(&clients_mutex);
+    return user_list;
+}
+
+void free_chats(chat_t *chat) {
+    if (chat) {
+        free(chat);
+    }
+}
+
+// Signal handling
+void signal_handler(int sig) {
+    switch (sig) {
         case SIGINT:
         case SIGTERM:
             printf("\nArrêt du serveur...\n");

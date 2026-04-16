@@ -2,7 +2,8 @@
   "files.associations": {
     "in.h": "c",
     "connection.h": "c",
-    "server.h": "c"
+    "server.h": "c",
+    "unistd.h": "c"
   },
   "C_Cpp_Runner.cCompilerPath": "gcc",
   "C_Cpp_Runner.cppCompilerPath": "g++",
